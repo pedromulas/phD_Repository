@@ -1,0 +1,7 @@
+data/
+*.nii
+*.nii.gz
+*.zip
+*.tar
+__pycache__/
+.env
