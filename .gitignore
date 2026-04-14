@@ -1,5 +1,6 @@
-# datos reales (DVC los gestiona)
-data/*
+# ignorar datos reales
+data/raw/*
+data/processed/*
 
 # PERMITIR archivos DVC
 !*.dvc
