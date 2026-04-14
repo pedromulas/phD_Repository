@@ -1,8 +1,15 @@
-data/**
-!data/**/*.dvc
+# Datasets reales (DVC los gestiona)
+data/
+
+# Pero permitir archivos DVC
+!*.dvc
+
+# Python
+__pycache__/
+.env
+
+# neuroimaging formats (opcional)
 *.nii
 *.nii.gz
 *.zip
 *.tar
-__pycache__/
-.env
