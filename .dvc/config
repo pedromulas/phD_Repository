@@ -1,0 +1,4 @@
+[core]
+    remote = myremote
+['remote "myremote"']
+    url = C:\Users\pedro\OneDrive - Universidad Rey Juan Carlos\pHD_Datasets
