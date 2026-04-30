@@ -9,6 +9,61 @@ from matplotlib.widgets import Slider
 from nilearn import image
 
 
+DEFAULT_FMRI_ROOT = Path(
+    r"C:\Users\pedro\Documents\DOCTORADO_Pedro\Code\phD_Repository\data\raw\Dataset1\Simultaneous_EEG_fMRI\BIDS_dataset_MRI"
+)
+
+
+def find_subject_functionals(fmri_root: str | Path) -> dict[str, list[Path]]:
+    fmri_root = Path(fmri_root)
+    functional_files = sorted(fmri_root.glob("sub-*/ses-001/func/*_bold.nii.gz"))
+
+    subject_map: dict[str, list[Path]] = {}
+    for fmri_path in functional_files:
+        subject_map.setdefault(fmri_path.parts[-4], []).append(fmri_path)
+
+    return subject_map
+
+
+def find_anatomical_for_subject(fmri_root: str | Path, subject: str) -> Path | None:
+    fmri_root = Path(fmri_root)
+    anat_files = sorted((fmri_root / subject / "ses-001" / "anat").glob("*_T1w.nii.gz"))
+    return anat_files[0] if anat_files else None
+
+
+def get_subject_functionals(fmri_root: str | Path, subject: str) -> list[Path]:
+    subject_map = find_subject_functionals(fmri_root)
+    if subject not in subject_map:
+        raise ValueError(f"No se encontraron adquisiciones fMRI para {subject}.")
+    return subject_map[subject]
+
+
+def get_subject_fmri_path(
+    subject: str,
+    fmri_root: str | Path = DEFAULT_FMRI_ROOT,
+    acquisition: str | None = None,
+) -> Path:
+    fmri_options = get_subject_functionals(fmri_root, subject)
+
+    if acquisition is None:
+        if len(fmri_options) != 1:
+            names = ", ".join(path.name for path in fmri_options)
+            raise ValueError(
+                f"{subject} tiene varias adquisiciones fMRI. Especifica una de: {names}"
+            )
+        return fmri_options[0]
+
+    for fmri_path in fmri_options:
+        if acquisition in fmri_path.name:
+            return fmri_path
+
+    available = ", ".join(path.name for path in fmri_options)
+    raise ValueError(
+        f"No se encontro una adquisicion que contenga '{acquisition}' para {subject}. "
+        f"Disponibles: {available}"
+    )
+
+
 def launch_interactive_viewer(
     fmri_path: str | Path, anat_path: str | Path | None = None
 ) -> None:
@@ -25,8 +80,6 @@ def launch_interactive_viewer(
     anat_data = None
     if anat_path is not None:
         anat_img = nib.load(str(Path(anat_path)))
-        # Rejillas distintas entre T1 y BOLD son normales; remuestreamos la T1 al
-        # espacio del funcional para poder usarla como fondo interactivo.
         anat_img = image.resample_to_img(
             anat_img,
             image.index_img(img, 0),
@@ -140,8 +193,12 @@ def launch_interactive_viewer(
     plt.show()
 
 
-if __name__ == "__main__":
-    launch_interactive_viewer(
-        r"C:\Users\pedro\Documents\DOCTORADO_Pedro\Code\phD_Repository\data\raw\Dataset1\Simultaneous_EEG_fMRI\BIDS_dataset_MRI\sub-001\ses-001\func\sub-001_ses-001_task-eoec_bold.nii.gz",
-        r"C:\Users\pedro\Documents\DOCTORADO_Pedro\Code\phD_Repository\data\raw\Dataset1\Simultaneous_EEG_fMRI\BIDS_dataset_MRI\sub-001\ses-001\anat\sub-001_ses-001_acq-highres_T1w.nii.gz",
-    )
+def view_subject_fmri(
+    subject: str,
+    fmri_root: str | Path = DEFAULT_FMRI_ROOT,
+    acquisition: str | None = None,
+    use_anatomical: bool = True,
+) -> None:
+    fmri_path = get_subject_fmri_path(subject, fmri_root=fmri_root, acquisition=acquisition)
+    anat_path = find_anatomical_for_subject(fmri_root, subject) if use_anatomical else None
+    launch_interactive_viewer(fmri_path, anat_path)
