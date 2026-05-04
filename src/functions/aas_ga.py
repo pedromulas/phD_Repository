@@ -194,6 +194,27 @@ def compute_template(segments: ArrayLike) -> np.ndarray:
     return np.mean(segments, axis=0)
 
 
+def _fixed_window_bounds(n_segments: int, center_idx: int, window_size: int) -> tuple[int, int]:
+    """Return fixed-size window bounds, shifting the window at the edges."""
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1.")
+    if window_size > n_segments:
+        return 0, n_segments
+
+    half_window = window_size // 2
+    start = center_idx - half_window
+    stop = start + window_size
+
+    if start < 0:
+        start = 0
+        stop = window_size
+    elif stop > n_segments:
+        stop = n_segments
+        start = n_segments - window_size
+
+    return start, stop
+
+
 def shift_signal(signal: ArrayLike, lag: int) -> np.ndarray:
     """Shift a 1D signal using zero padding instead of circular wrapping.
 
@@ -340,7 +361,11 @@ def iterative_realignment(
     return aligned, final_template, cumulative_lags
 
 
-def apply_aas(segments: ArrayLike, window_size: int = 21) -> tuple[np.ndarray, np.ndarray]:
+def apply_aas(
+    segments: ArrayLike,
+    window_size: int = 21,
+    variance_threshold: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Apply sliding-window Average Artifact Subtraction to aligned segments.
 
     Parameters
@@ -349,33 +374,51 @@ def apply_aas(segments: ArrayLike, window_size: int = 21) -> tuple[np.ndarray, n
         2D array with shape ``(n_segments, T_samples)``.
     window_size
         Number of neighboring segments used to build the local artifact
-        template. The window is centered on each segment when possible.
+        template. A fixed-size window is used whenever possible, shifting
+        toward the signal interior at the edges.
+    variance_threshold
+        Optional upper bound on the local alignment score. If the neighboring
+        segments inside the window are too inconsistent and the score exceeds
+        this threshold, the corresponding segment is left unchanged.
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        Cleaned segments and the local templates that were subtracted.
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Cleaned segments, local templates, local variance scores, and a
+        boolean mask indicating which segments were actually cleaned.
     """
     segments = np.asarray(segments, dtype=np.float64)
     if segments.ndim != 2:
         raise ValueError("segments must have shape (n_segments, T_samples).")
     if window_size < 1:
         raise ValueError("window_size must be at least 1.")
+    if variance_threshold is not None and variance_threshold < 0:
+        raise ValueError("variance_threshold must be non-negative or None.")
 
     n_segments, T_samples = segments.shape
-    half_window = window_size // 2
 
     cleaned = np.empty_like(segments)
     templates = np.empty((n_segments, T_samples), dtype=np.float64)
+    local_scores = np.empty(n_segments, dtype=np.float64)
+    cleaned_mask = np.zeros(n_segments, dtype=bool)
 
     for idx in range(n_segments):
-        start = max(0, idx - half_window)
-        stop = min(n_segments, idx + half_window + 1)
-        local_template = np.mean(segments[start:stop], axis=0)
-        templates[idx] = local_template
-        cleaned[idx] = segments[idx] - local_template
+        start, stop = _fixed_window_bounds(n_segments, idx, window_size)
+        window_segments = segments[start:stop]
+        local_template = np.mean(window_segments, axis=0)
+        local_score = compute_alignment_score(window_segments)
 
-    return cleaned, templates
+        templates[idx] = local_template
+        local_scores[idx] = local_score
+
+        if variance_threshold is not None and local_score > variance_threshold:
+            cleaned[idx] = segments[idx]
+            continue
+
+        cleaned[idx] = segments[idx] - local_template
+        cleaned_mask[idx] = True
+
+    return cleaned, templates, local_scores, cleaned_mask
 
 
 def reconstruct_signal(
@@ -437,6 +480,7 @@ def run_aas_pipeline(
     n_iter: int = 5,
     window_size: int = 21,
     max_lag: int | None = None,
+    variance_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Run the full trigger-free GA removal pipeline.
 
@@ -456,6 +500,9 @@ def run_aas_pipeline(
         Number of neighboring segments used in sliding-window AAS.
     max_lag
         Optional maximum allowed lag in samples.
+    variance_threshold
+        Optional upper bound on the local variance score used to decide
+        whether a segment should be cleaned or left unchanged.
 
     Returns
     -------
@@ -482,10 +529,18 @@ def run_aas_pipeline(
 
     cleaned_all = np.empty_like(aligned_all)
     local_templates = np.empty_like(aligned_all)
+    local_scores = np.empty((aligned_all.shape[0], aligned_all.shape[1]), dtype=np.float64)
+    cleaned_mask = np.zeros((aligned_all.shape[0], aligned_all.shape[1]), dtype=bool)
     for channel_idx in range(aligned_all.shape[0]):
-        cleaned_channel, template_channel = apply_aas(aligned_all[channel_idx], window_size=window_size)
+        cleaned_channel, template_channel, score_channel, mask_channel = apply_aas(
+            aligned_all[channel_idx],
+            window_size=window_size,
+            variance_threshold=variance_threshold,
+        )
         cleaned_all[channel_idx] = cleaned_channel
         local_templates[channel_idx] = template_channel
+        local_scores[channel_idx] = score_channel
+        cleaned_mask[channel_idx] = mask_channel
 
     cleaned_signal = reconstruct_signal(cleaned_all, signal_2d.shape[1], offset)
     if was_1d:
@@ -494,12 +549,16 @@ def run_aas_pipeline(
         cleaned_segments_out = cleaned_all[0]
         cleaned_signal_out = cleaned_signal[0]
         local_templates_out = local_templates[0]
+        local_scores_out = local_scores[0]
+        cleaned_mask_out = cleaned_mask[0]
     else:
         segmented_out = segmented
         aligned_out = aligned_all
         cleaned_segments_out = cleaned_all
         cleaned_signal_out = cleaned_signal
         local_templates_out = local_templates
+        local_scores_out = local_scores
+        cleaned_mask_out = cleaned_mask
 
     return {
         "cleaned_signal": cleaned_signal_out,
@@ -511,5 +570,7 @@ def run_aas_pipeline(
         "cleaned_segments": cleaned_segments_out,
         "final_reference_template": final_template,
         "local_templates": local_templates_out,
+        "local_alignment_scores": local_scores_out,
+        "cleaned_segment_mask": cleaned_mask_out,
         "aligned_reference_segments": aligned_reference,
     }
