@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.optimize import minimize
 from scipy.signal import resample
 
-from functions.aas_ga import _as_2d, run_aas_pipeline
+from functions.aas_ga import _as_2d, find_best_offset, run_aas_pipeline, tr_to_samples
 
 
 ArrayLike = np.ndarray
+
+if TYPE_CHECKING:
+    import mne
 
 
 def _validate_positive(name: str, value: float) -> None:
@@ -442,6 +445,7 @@ def run_resync_aas_pipeline(
     TR: float,
     fs: float,
     reference_channel: int = 0,
+    use_fmri_bounds: bool = False,
     fmri_start_sample: int | None = None,
     fmri_end_sample: int | None = None,
     start_search_step: int | None = None,
@@ -455,50 +459,143 @@ def run_resync_aas_pipeline(
     max_lag: int | None = None,
     variance_threshold: float | None = None,
 ) -> dict[str, Any]:
-    """Estimate fMRI start/end, run Resync, and apply AAS only on the fMRI part.
+    """Estimate fMRI start/end, run global Resync, and apply AAS on the fMRI part.
 
     After Resync, the new effective sampling rate becomes ``fs * D_applied`` so
-    that one fMRI TR corresponds to an integer number of EEG samples. AAS is
-    then applied only from the detected fMRI onset onward, leaving the earlier
-    pre-scan EEG untouched.
+    that one fMRI TR corresponds to an integer number of EEG samples. The
+    Fourier interpolation is applied globally to the full recording, as required
+    by the Resync method, and AAS is then applied on the resynchronized fMRI
+    interval using ``run_aas_pipeline``. When ``use_fmri_bounds`` is ``False``,
+    the full EEG recording is processed and the fMRI interval defaults to the
+    complete signal.
     """
     signal_2d, was_1d = _as_2d(signal)
-    if fmri_start_sample is None:
-        start_info = estimate_fmri_start(
+    if not use_fmri_bounds:
+        full_start_sample = 0
+        full_end_sample = signal_2d.shape[1]
+        full_start_info = {
+            "fmri_start_sample": full_start_sample,
+            "fmri_start_time_sec": 0.0,
+            "search_step": None,
+            "n_epochs_eval": None,
+            "mode": "full_signal",
+        }
+        full_end_info = {
+            "fmri_end_sample": full_end_sample,
+            "fmri_end_time_sec": full_end_sample / fs,
+            "search_step": None,
+            "n_epochs_eval": None,
+            "mode": "full_signal",
+        }
+
+        resync_info = estimate_resync_factor(
             signal=signal_2d,
             TR=TR,
             fs=fs,
             reference_channel=reference_channel,
-            search_step=start_search_step,
-            n_epochs_eval=start_n_epochs_eval,
+            fmri_start_sample=0,
+            search_radius=search_radius,
+            grid_points=grid_points,
         )
-        fmri_start_sample = start_info["fmri_start_sample"]
-    else:
-        start_info = {
-            "fmri_start_sample": int(fmri_start_sample),
-            "fmri_start_time_sec": float(fmri_start_sample) / fs,
-            "search_step": start_search_step,
-            "n_epochs_eval": start_n_epochs_eval,
-        }
 
-    if fmri_end_sample is None:
-        end_info = estimate_fmri_end(
-            signal=signal_2d,
-            TR=TR,
-            fs=fs,
+        resynced_full_signal, n_resynced = fourier_resync_signal(signal_2d, resync_info["D_applied"])
+        fs_resynced = fs * resync_info["D_applied"]
+        offset_resynced = find_best_offset(
+            resynced_full_signal,
+            tr_to_samples(TR, fs_resynced),
             reference_channel=reference_channel,
-            search_step=end_search_step,
-            n_epochs_eval=end_n_epochs_eval,
         )
-        fmri_end_sample = end_info["fmri_end_sample"]
-    else:
-        end_info = {
-            "fmri_end_sample": int(fmri_end_sample),
-            "fmri_end_time_sec": float(fmri_end_sample) / fs,
-            "search_step": end_search_step,
-            "n_epochs_eval": end_n_epochs_eval,
+
+        aas_result = run_aas_pipeline(
+            signal=resynced_full_signal,
+            TR=TR,
+            fs=fs_resynced,
+            reference_channel=reference_channel,
+            n_iter=n_iter,
+            window_size=window_size,
+            max_lag=max_lag,
+            variance_threshold=variance_threshold,
+            offset=offset_resynced,
+        )
+
+        cleaned_full_signal, _ = _as_2d(aas_result["cleaned_signal"])
+        if was_1d:
+            resynced_signal_out = resynced_full_signal[0]
+            cleaned_signal_out = cleaned_full_signal[0]
+        else:
+            resynced_signal_out = resynced_full_signal
+            cleaned_signal_out = cleaned_full_signal
+
+        return {
+            "resynced_signal": resynced_signal_out,
+            "n_resynced_samples": n_resynced,
+            "fs_resynced": fs_resynced,
+            "use_fmri_bounds": False,
+            "fmri_start_sample": full_start_sample,
+            "fmri_start_time_sec": 0.0,
+            "fmri_end_sample": full_end_sample,
+            "fmri_end_time_sec": full_end_sample / fs,
+            "fmri_start_sample_resynced": 0,
+            "fmri_start_time_sec_resynced": 0.0,
+            "fmri_end_sample_resynced": n_resynced,
+            "fmri_end_time_sec_resynced": n_resynced / fs_resynced,
+            "start_detection": full_start_info,
+            "end_detection": full_end_info,
+            "D_opt": resync_info["D_opt"],
+            "D_applied": resync_info["D_applied"],
+            "R_opt": resync_info["R_opt"],
+            "nominal_tr_samples": resync_info["nominal_tr_samples"],
+            "synced_tr_samples": resync_info["synced_tr_samples"],
+            "acs_nominal": resync_info["acs_nominal"],
+            "acs_optimized": resync_info["acs_optimized"],
+            "acs_applied": resync_info["acs_applied"],
+            "optimizer_success": resync_info["optimizer_success"],
+            "optimizer_message": resync_info["optimizer_message"],
+            "coarse_grid": resync_info["coarse_grid"],
+            "coarse_scores": resync_info["coarse_scores"],
+            "offset_resynced": offset_resynced,
+            "aas": aas_result,
+            "cleaned_signal": cleaned_signal_out,
         }
 
+    if use_fmri_bounds:
+        if fmri_start_sample is None:
+            start_info = estimate_fmri_start(
+                signal=signal_2d,
+                TR=TR,
+                fs=fs,
+                reference_channel=reference_channel,
+                search_step=start_search_step,
+                n_epochs_eval=start_n_epochs_eval,
+            )
+            fmri_start_sample = start_info["fmri_start_sample"]
+        else:
+            start_info = {
+                "fmri_start_sample": int(fmri_start_sample),
+                "fmri_start_time_sec": float(fmri_start_sample) / fs,
+                "search_step": start_search_step,
+                "n_epochs_eval": start_n_epochs_eval,
+                "mode": "manual",
+            }
+
+        if fmri_end_sample is None:
+            end_info = estimate_fmri_end(
+                signal=signal_2d,
+                TR=TR,
+                fs=fs,
+                reference_channel=reference_channel,
+                search_step=end_search_step,
+                n_epochs_eval=end_n_epochs_eval,
+            )
+            fmri_end_sample = end_info["fmri_end_sample"]
+        else:
+            end_info = {
+                "fmri_end_sample": int(fmri_end_sample),
+                "fmri_end_time_sec": float(fmri_end_sample) / fs,
+                "search_step": end_search_step,
+                "n_epochs_eval": end_n_epochs_eval,
+                "mode": "manual",
+            }
     fmri_start_sample = int(fmri_start_sample)
     fmri_end_sample = int(fmri_end_sample)
     if fmri_start_sample < 0 or fmri_start_sample >= signal_2d.shape[1]:
@@ -521,8 +618,19 @@ def run_resync_aas_pipeline(
         grid_points=grid_points,
     )
 
-    resynced_fmri_signal, n_resynced = fourier_resync_signal(fmri_signal, resync_info["D_applied"])
+    resynced_full_signal, n_resynced = fourier_resync_signal(signal_2d, resync_info["D_applied"])
     fs_resynced = fs * resync_info["D_applied"]
+    fmri_start_sample_resynced = int(round(fmri_start_sample * resync_info["D_applied"]))
+    fmri_end_sample_resynced = int(round(fmri_end_sample * resync_info["D_applied"]))
+    fmri_start_sample_resynced = max(0, min(fmri_start_sample_resynced, n_resynced - 1))
+    fmri_end_sample_resynced = max(fmri_start_sample_resynced + 1, min(fmri_end_sample_resynced, n_resynced))
+
+    resynced_fmri_signal = resynced_full_signal[:, fmri_start_sample_resynced:fmri_end_sample_resynced]
+    offset_resynced = find_best_offset(
+        resynced_fmri_signal,
+        tr_to_samples(TR, fs_resynced),
+        reference_channel=reference_channel,
+    )
 
     aas_result = run_aas_pipeline(
         signal=resynced_fmri_signal,
@@ -533,32 +641,28 @@ def run_resync_aas_pipeline(
         window_size=window_size,
         max_lag=max_lag,
         variance_threshold=variance_threshold,
-        offset=0,
+        offset=offset_resynced,
     )
 
     cleaned_fmri_2d, _ = _as_2d(aas_result["cleaned_signal"])
-    fmri_length_resynced = resynced_fmri_signal.shape[1]
-    total_length_resynced = (
-        fmri_start_sample
-        + fmri_length_resynced
-        + (signal_2d.shape[1] - fmri_end_sample)
+    aligned_segments = np.asarray(aas_result["aligned_segments"])
+    if aligned_segments.ndim == 2:
+        n_complete_segments = int(aligned_segments.shape[0])
+    else:
+        n_complete_segments = int(aligned_segments.shape[1])
+    tr_samples_resynced = int(aas_result["T_samples"])
+    aas_covered_start = int(offset_resynced)
+    aas_covered_stop = min(
+        resynced_fmri_signal.shape[1],
+        aas_covered_start + n_complete_segments * tr_samples_resynced,
     )
 
-    resynced_full = np.zeros((signal_2d.shape[0], total_length_resynced), dtype=np.float64)
-    cleaned_full = np.zeros_like(resynced_full)
-
-    pre_fmri = signal_2d[:, :fmri_start_sample]
-    post_fmri = signal_2d[:, fmri_end_sample:]
-
-    resynced_full[:, :fmri_start_sample] = pre_fmri
-    cleaned_full[:, :fmri_start_sample] = pre_fmri
-
-    fmri_stop_resynced = fmri_start_sample + fmri_length_resynced
-    resynced_full[:, fmri_start_sample:fmri_stop_resynced] = resynced_fmri_signal
-    cleaned_full[:, fmri_start_sample:fmri_stop_resynced] = cleaned_fmri_2d
-
-    resynced_full[:, fmri_stop_resynced:] = post_fmri
-    cleaned_full[:, fmri_stop_resynced:] = post_fmri
+    resynced_full = resynced_full_signal.copy()
+    cleaned_full = resynced_full_signal.copy()
+    cleaned_full[
+        :,
+        fmri_start_sample_resynced + aas_covered_start : fmri_start_sample_resynced + aas_covered_stop,
+    ] = cleaned_fmri_2d[:, aas_covered_start:aas_covered_stop]
 
     if was_1d:
         resynced_signal_out = resynced_full[0]
@@ -569,16 +673,17 @@ def run_resync_aas_pipeline(
 
     output: dict[str, Any] = {
         "resynced_signal": resynced_signal_out,
-        "n_resynced_samples": total_length_resynced,
+        "n_resynced_samples": n_resynced,
         "fs_resynced": fs_resynced,
+        "use_fmri_bounds": use_fmri_bounds,
         "fmri_start_sample": fmri_start_sample,
         "fmri_start_time_sec": start_info["fmri_start_time_sec"],
         "fmri_end_sample": fmri_end_sample,
         "fmri_end_time_sec": end_info["fmri_end_time_sec"],
-        "fmri_start_sample_resynced": fmri_start_sample,
-        "fmri_start_time_sec_resynced": fmri_start_sample / fs_resynced,
-        "fmri_end_sample_resynced": fmri_stop_resynced,
-        "fmri_end_time_sec_resynced": fmri_stop_resynced / fs_resynced,
+        "fmri_start_sample_resynced": fmri_start_sample_resynced,
+        "fmri_start_time_sec_resynced": fmri_start_sample_resynced / fs_resynced,
+        "fmri_end_sample_resynced": fmri_end_sample_resynced,
+        "fmri_end_time_sec_resynced": fmri_end_sample_resynced / fs_resynced,
         "start_detection": start_info,
         "end_detection": end_info,
         "D_opt": resync_info["D_opt"],
@@ -593,7 +698,67 @@ def run_resync_aas_pipeline(
         "optimizer_message": resync_info["optimizer_message"],
         "coarse_grid": resync_info["coarse_grid"],
         "coarse_scores": resync_info["coarse_scores"],
+        "offset_resynced": offset_resynced,
         "aas": aas_result,
         "cleaned_signal": cleaned_signal_out,
     }
     return output
+
+
+def run_resync_aas_on_raw(
+    raw: "mne.io.BaseRaw",
+    TR: float,
+    reference_channel: int = 0,
+    use_fmri_bounds: bool = False,
+    fmri_start_sample: int | None = None,
+    fmri_end_sample: int | None = None,
+    start_search_step: int | None = None,
+    end_search_step: int | None = None,
+    start_n_epochs_eval: int = 6,
+    end_n_epochs_eval: int = 6,
+    search_radius: float = 5e-3,
+    grid_points: int = 41,
+    n_iter: int = 5,
+    window_size: int = 21,
+    max_lag: int | None = None,
+    variance_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Apply Resync + AAS directly to an MNE Raw object."""
+    import mne
+
+    data = raw.get_data()
+    fs = float(raw.info["sfreq"])
+
+    result = run_resync_aas_pipeline(
+        signal=data,
+        TR=TR,
+        fs=fs,
+        reference_channel=reference_channel,
+        use_fmri_bounds=use_fmri_bounds,
+        fmri_start_sample=fmri_start_sample,
+        fmri_end_sample=fmri_end_sample,
+        start_search_step=start_search_step,
+        end_search_step=end_search_step,
+        start_n_epochs_eval=start_n_epochs_eval,
+        end_n_epochs_eval=end_n_epochs_eval,
+        search_radius=search_radius,
+        grid_points=grid_points,
+        n_iter=n_iter,
+        window_size=window_size,
+        max_lag=max_lag,
+        variance_threshold=variance_threshold,
+    )
+
+    cleaned_2d, _ = _as_2d(result["cleaned_signal"])
+    info = mne.create_info(
+        ch_names=raw.ch_names,
+        sfreq=result["fs_resynced"],
+        ch_types=raw.get_channel_types(),
+    )
+    for key in ("bads", "description", "experimenter", "line_freq", "subject_info"):
+        if key in raw.info:
+            info[key] = raw.info[key]
+    cleaned_raw = mne.io.RawArray(cleaned_2d, info, verbose="ERROR")
+
+    result["cleaned_raw"] = cleaned_raw
+    return result
