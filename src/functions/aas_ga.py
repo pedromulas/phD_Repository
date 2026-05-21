@@ -380,7 +380,6 @@ def apply_aas(
         Optional upper bound on the local alignment score. If the neighboring
         segments inside the window are too inconsistent and the score exceeds
         this threshold, the corresponding segment is left unchanged.
-
     Returns
     -------
     tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
@@ -394,7 +393,6 @@ def apply_aas(
         raise ValueError("window_size must be at least 1.")
     if variance_threshold is not None and variance_threshold < 0:
         raise ValueError("variance_threshold must be non-negative or None.")
-
     n_segments, T_samples = segments.shape
 
     cleaned = np.empty_like(segments)
@@ -481,6 +479,7 @@ def run_aas_pipeline(
     window_size: int = 21,
     max_lag: int | None = None,
     variance_threshold: float | None = None,
+    offset: int | None = None,
 ) -> dict[str, Any]:
     """Run the full trigger-free GA removal pipeline.
 
@@ -503,7 +502,9 @@ def run_aas_pipeline(
     variance_threshold
         Optional upper bound on the local variance score used to decide
         whether a segment should be cleaned or left unchanged.
-
+    offset
+        Optional fixed starting offset, in samples, of the first TR boundary.
+        If ``None``, the offset is estimated from the input signal.
     Returns
     -------
     dict[str, Any]
@@ -512,7 +513,10 @@ def run_aas_pipeline(
     """
     signal_2d, was_1d = _as_2d(signal)
     T_samples = tr_to_samples(TR, fs)
-    offset = find_best_offset(signal_2d, T_samples, reference_channel=reference_channel)
+    if offset is None:
+        offset = find_best_offset(signal_2d, T_samples, reference_channel=reference_channel)
+    else:
+        _validate_offset(offset, T_samples)
 
     segmented = segment_signal(signal_2d, T_samples, offset)
     reference_segments = segmented[reference_channel]
