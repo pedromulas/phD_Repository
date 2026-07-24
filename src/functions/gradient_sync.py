@@ -40,6 +40,18 @@ class GradientSyncDetection:
     n_slices: int
     analysis_channel_indices: tuple[int, ...]
     analysis_channel_names: tuple[str, ...] | None
+    t_ga_sample: int
+    t_ga_sec: float
+    t_ga_end_sample: int
+    t_ga_end_sec: float
+    t_bold_sample: int
+    t_bold_sec: float
+    t_bold_end_sample: int
+    t_bold_end_sec: float
+    energy_window_samples: int
+    energy_samples: np.ndarray
+    multichannel_energy: np.ndarray
+    energy_threshold: float
 
 
 def _as_2d(signal: np.ndarray) -> np.ndarray:
@@ -162,6 +174,58 @@ def _find_periodic_window_index(
     return None
 
 
+def _persistent_activity_bounds(
+    channel_features: list[np.ndarray],
+    fs: float,
+    tr_sec: float,
+    calibration_seconds: float,
+    threshold_sigma: float,
+    window_seconds: float = 0.25,
+) -> tuple[int, int, int, np.ndarray, np.ndarray, float]:
+    """Detect the first/last sustained GA-energy interval across EEG channels.
+
+    The baseline falls back to the quietest 5% of the whole recording when
+    the initial calibration window already contains gradient artefacts.
+    """
+    if not channel_features:
+        raise ValueError("At least one analysis channel is required.")
+    n_samples = channel_features[0].size
+    window_samples = max(1, int(round(window_seconds * fs)))
+    scales = np.asarray([max(float(np.quantile(feature, 0.05)), np.finfo(float).eps) for feature in channel_features])
+    normalized = np.median(np.vstack([feature / scale for feature, scale in zip(channel_features, scales, strict=True)]), axis=0)
+    starts = np.arange(0, n_samples, window_samples, dtype=np.int64)
+    energy = np.asarray([np.median(normalized[start : min(start + window_samples, n_samples)]) for start in starts])
+    energy_samples = np.minimum(starts + window_samples // 2, n_samples - 1)
+
+    calibration_windows = max(1, int(np.ceil(calibration_seconds * fs / window_samples)))
+    initial = energy[:calibration_windows]
+    global_quiet = energy[energy <= np.quantile(energy, 0.05)]
+    # Prefer the intended initial baseline only when it is comparable to the
+    # quietest part of the recording; otherwise fMRI had already begun there.
+    baseline = initial if np.median(initial) <= np.median(global_quiet) * 1.5 else global_quiet
+    center = float(np.median(baseline))
+    robust_std = float(1.4826 * np.median(np.abs(baseline - center)))
+    threshold = center + threshold_sigma * max(robust_std, np.finfo(float).eps)
+    active = energy > threshold
+
+    minimum_windows = max(2, int(np.ceil(max(2.0 * tr_sec, 1.0) * fs / window_samples)))
+    required_active = int(np.ceil(0.75 * minimum_windows))
+    activity_count = np.convolve(active.astype(int), np.ones(minimum_windows, dtype=int), mode="valid")
+    valid_starts = np.flatnonzero(activity_count >= required_active)
+    if valid_starts.size == 0:
+        raise ValueError("No sustained high-frequency GA interval was detected.")
+    start_window = int(valid_starts[0])
+    end_window = int(valid_starts[-1] + minimum_windows - 1)
+    return (
+        int(starts[start_window]),
+        int(min(n_samples, starts[end_window] + window_samples)),
+        window_samples,
+        energy_samples,
+        energy,
+        float(threshold),
+    )
+
+
 def detect_gradient_artifact_start(
     signal: np.ndarray,
     fs: float,
@@ -169,7 +233,7 @@ def detect_gradient_artifact_start(
     n_slices: int,
     *,
     channel_names: Sequence[str] | None = None,
-    calibration_seconds: float = 100.0,
+    calibration_seconds: float = 5.0,
     low_hz: float = 10.0,
     high_hz: float = 200.0,
     threshold_sigma: float = 6.0,
@@ -179,7 +243,13 @@ def detect_gradient_artifact_start(
     min_channels_fraction: float = 0.25,
     min_cycle_peaks: int = 4,
 ) -> GradientSyncDetection:
-    """Estimate the first fMRI volume onset from gradient-artifact morphology."""
+    """Estimate sustained GA bounds and the stable BOLD acquisition interval.
+
+    ``t_ga_*`` marks the first persistent high-frequency gradient activity,
+    including dummy scans. ``t_bold_*`` marks the later stable periodic block
+    compatible with the supplied TR and slice count. Legacy ``t0_*`` and
+    ``t_f_*`` alias the BOLD bounds for backwards compatibility.
+    """
     if fs <= 0:
         raise ValueError("fs must be strictly positive.")
     if tr_sec <= 0:
@@ -221,35 +291,29 @@ def detect_gradient_artifact_start(
         peak_samples_by_channel.append(peak_samples.astype(np.int64, copy=False))
         peak_values_by_channel.append(np.asarray(peak_properties.get("peak_heights", []), dtype=np.float64))
 
-    consensus_peaks, consensus_votes, consensus_amplitudes = _cluster_channel_peaks(
-        peak_samples_by_channel,
-        peak_values_by_channel,
-        tolerance_samples=cluster_tolerance_samples,
+    (
+        t_ga_sample,
+        t_ga_end_sample,
+        energy_window_samples,
+        energy_samples,
+        multichannel_energy,
+        energy_threshold,
+    ) = _persistent_activity_bounds(
+        channel_features,
+        fs,
+        tr_sec,
+        calibration_seconds,
+        threshold_sigma,
     )
 
-    if consensus_peaks.size == 0:
-        raise ValueError("No consensus gradient peaks were detected.")
+    concatenated_calibration = np.concatenate([feature[:calibration_samples] for feature in channel_features]) if channel_features else np.array([], dtype=np.float64)
 
-    valid_mask = consensus_votes >= min_channels
-    consensus_peaks = consensus_peaks[valid_mask]
-    consensus_votes = consensus_votes[valid_mask]
-    consensus_amplitudes = consensus_amplitudes[valid_mask]
-
-    consensus_times = consensus_peaks / float(fs)
-    differences = np.diff(consensus_times)
-
-    if consensus_peaks.size < max(min_cycle_peaks, 2):
-        t0_sample = int(consensus_peaks[0])
-        t_f_sample = int(consensus_peaks[-1])
-        t0_sec = t0_sample / float(fs)
-        t_f_sec = t_f_sample / float(fs)
-        concatenated_calibration = np.concatenate([feature[:calibration_samples] for feature in channel_features]) if channel_features else np.array([], dtype=np.float64)
-
+    def make_detection(t_bold_sample: int, t_bold_end_sample: int) -> GradientSyncDetection:
         return GradientSyncDetection(
-            t0_sample=t0_sample,
-            t0_sec=t0_sec,
-            t_f_sample=t_f_sample,
-            t_f_sec=t_f_sec,
+            t0_sample=t_bold_sample,
+            t0_sec=t_bold_sample / float(fs),
+            t_f_sample=t_bold_end_sample,
+            t_f_sec=t_bold_end_sample / float(fs),
             consensus_peaks=consensus_peaks,
             consensus_votes=consensus_votes,
             consensus_amplitudes=consensus_amplitudes,
@@ -262,7 +326,55 @@ def detect_gradient_artifact_start(
             n_slices=int(n_slices),
             analysis_channel_indices=analysis_channel_indices,
             analysis_channel_names=analysis_channel_names,
+            t_ga_sample=t_ga_sample,
+            t_ga_sec=t_ga_sample / float(fs),
+            t_ga_end_sample=t_ga_end_sample,
+            t_ga_end_sec=t_ga_end_sample / float(fs),
+            t_bold_sample=t_bold_sample,
+            t_bold_sec=t_bold_sample / float(fs),
+            t_bold_end_sample=t_bold_end_sample,
+            t_bold_end_sec=t_bold_end_sample / float(fs),
+            energy_window_samples=energy_window_samples,
+            energy_samples=energy_samples,
+            multichannel_energy=multichannel_energy,
+            energy_threshold=energy_threshold,
         )
+
+    consensus_peaks, consensus_votes, consensus_amplitudes = _cluster_channel_peaks(
+        peak_samples_by_channel,
+        peak_values_by_channel,
+        tolerance_samples=cluster_tolerance_samples,
+    )
+
+    if consensus_peaks.size == 0:
+        empty = np.array([], dtype=np.float64)
+        consensus_peaks = np.array([], dtype=np.int64)
+        consensus_votes = np.array([], dtype=np.int64)
+        consensus_amplitudes = empty
+        return make_detection(t_ga_sample, t_ga_end_sample)
+
+    valid_mask = consensus_votes >= min_channels
+    consensus_peaks = consensus_peaks[valid_mask]
+    consensus_votes = consensus_votes[valid_mask]
+    consensus_amplitudes = consensus_amplitudes[valid_mask]
+
+    if consensus_peaks.size == 0:
+        return make_detection(t_ga_sample, t_ga_end_sample)
+
+    # The periodic BOLD candidate must lie in the sustained GA interval. This
+    # prevents isolated pre-scan peaks from defining a false volume onset.
+    active_peaks = consensus_peaks >= t_ga_sample
+    consensus_peaks = consensus_peaks[active_peaks]
+    consensus_votes = consensus_votes[active_peaks]
+    consensus_amplitudes = consensus_amplitudes[active_peaks]
+    if consensus_peaks.size == 0:
+        return make_detection(t_ga_sample, t_ga_end_sample)
+
+    consensus_times = consensus_peaks / float(fs)
+    differences = np.diff(consensus_times)
+
+    if consensus_peaks.size < max(min_cycle_peaks, 2):
+        return make_detection(int(consensus_peaks[0]), int(consensus_peaks[-1]))
 
     candidate_index = None
     required_peaks = min(consensus_peaks.size, max(min_cycle_peaks, n_slices + 1))
@@ -301,55 +413,11 @@ def detect_gradient_artifact_start(
                 break
 
     if candidate_index is None:
-        t0_sample = int(consensus_peaks[0])
-        t_f_sample = int(consensus_peaks[-1])
-        t0_sec = t0_sample / float(fs)
-        t_f_sec = t_f_sample / float(fs)
-        concatenated_calibration = np.concatenate([feature[:calibration_samples] for feature in channel_features]) if channel_features else np.array([], dtype=np.float64)
-
-        return GradientSyncDetection(
-            t0_sample=t0_sample,
-            t0_sec=t0_sec,
-            t_f_sample=t_f_sample,
-            t_f_sec=t_f_sec,
-            consensus_peaks=consensus_peaks,
-            consensus_votes=consensus_votes,
-            consensus_amplitudes=consensus_amplitudes,
-            threshold=float(np.mean(thresholds)),
-            calibration_seconds=float(calibration_samples / fs),
-            calibration_mean=float(np.mean(concatenated_calibration)) if concatenated_calibration.size else 0.0,
-            calibration_std=float(np.std(concatenated_calibration)) if concatenated_calibration.size else 0.0,
-            slice_period_sec=float(expected_slice_period),
-            tr_sec=float(tr_sec),
-            n_slices=int(n_slices),
-            analysis_channel_indices=analysis_channel_indices,
-            analysis_channel_names=analysis_channel_names,
-        )
+        return make_detection(t_ga_sample, t_ga_end_sample)
 
     t0_sample = int(consensus_peaks[candidate_index])
     if candidate_index_end is None:
         t_f_sample = int(consensus_peaks[-1])
     else:
         t_f_sample = int(consensus_peaks[min(candidate_index_end + required_peaks - 1, consensus_peaks.size - 1)])
-    t0_sec = t0_sample / float(fs)
-    t_f_sec = t_f_sample / float(fs)
-    concatenated_calibration = np.concatenate([feature[:calibration_samples] for feature in channel_features]) if channel_features else np.array([], dtype=np.float64)
-
-    return GradientSyncDetection(
-        t0_sample=t0_sample,
-        t0_sec=t0_sec,
-        t_f_sample=t_f_sample,
-        t_f_sec=t_f_sec,
-        consensus_peaks=consensus_peaks,
-        consensus_votes=consensus_votes,
-        consensus_amplitudes=consensus_amplitudes,
-        threshold=float(np.mean(thresholds)),
-        calibration_seconds=float(calibration_samples / fs),
-        calibration_mean=float(np.mean(concatenated_calibration)) if concatenated_calibration.size else 0.0,
-        calibration_std=float(np.std(concatenated_calibration)) if concatenated_calibration.size else 0.0,
-        slice_period_sec=float(expected_slice_period),
-        tr_sec=float(tr_sec),
-        n_slices=int(n_slices),
-        analysis_channel_indices=analysis_channel_indices,
-        analysis_channel_names=analysis_channel_names,
-    )
+    return make_detection(t0_sample, t_f_sample)
