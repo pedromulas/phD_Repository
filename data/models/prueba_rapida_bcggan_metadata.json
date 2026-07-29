@@ -1,0 +1,9 @@
+{
+  "records": 15,
+  "windows_total": 256,
+  "windows_train": 192,
+  "windows_validation": 64,
+  "window_seconds": 5.0,
+  "sampling_frequency": 1000.0,
+  "best_validation_generator_loss": 4.679275758564472
+}

@@ -1,0 +1,19 @@
+{
+  "records": 15,
+  "windows_total": 59680,
+  "windows_train": 47744,
+  "windows_validation": 11936,
+  "window_seconds": 5.0,
+  "sampling_frequency": 1000.0,
+  "best_validation_generator_loss": 1.658568895933775,
+  "raw_root": "data\\raw\\Dataset1\\Simultaneous_EEG_fMRI\\BIDS_dataset_EEG",
+  "reference_root": "data\\raw\\Dataset1\\Simultaneous_EEG_fMRI\\BIDS_dataset_EEG\\derivatives\\Gradient_artifact_corrected",
+  "task": "fmrirestingec",
+  "seed": 42,
+  "learning_rate": 0.0001,
+  "early_stopping_enabled": false,
+  "early_stopping_patience": 8,
+  "early_stopping_min_delta": 0.001,
+  "device": "cuda",
+  "loss_ema_alpha": 0.3
+}

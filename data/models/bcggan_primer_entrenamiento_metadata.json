@@ -1,0 +1,11 @@
+{
+  "records": 15,
+  "windows_total": 59680,
+  "windows_train": 47744,
+  "windows_validation": 11936,
+  "window_seconds": 5.0,
+  "sampling_frequency": 1000.0,
+  "best_validation_generator_loss": 1.5786299502561942,
+  "early_stopping_patience": 8,
+  "early_stopping_min_delta": 0.001
+}

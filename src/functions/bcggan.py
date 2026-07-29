@@ -291,8 +291,13 @@ class BCGGANTrainer:
         tensor = torch.as_tensor(corrupted, dtype=torch.float32, device=self.device)
         return self.bcg_to_clean(tensor).cpu().numpy()
 
-    def clean_continuous(self, corrupted: np.ndarray, fs: float, window_s: float = 1.0, stride_s: float = 1.0, batch_size: int = 32) -> np.ndarray:
-        """Clean continuous EEG and reconstruct it by overlap-add averaging."""
+    def clean_continuous(self, corrupted: np.ndarray, fs: float, window_s: float = 5.0, stride_s: float = 5.0, batch_size: int = 32) -> np.ndarray:
+        """Clean continuous EEG with sequential 5-s training windows.
+
+        The default is non-overlapping 5-s windows, so inferred outputs are
+        concatenated chronologically and match the representation used in
+        training. A final fragment shorter than a full window is retained.
+        """
         normalized, starts, means, scales = _window_data(corrupted, fs, window_s, stride_s)
         output = np.zeros_like(corrupted, dtype=np.float32)
         weights = np.zeros(corrupted.shape[1], dtype=np.float32)
@@ -308,7 +313,7 @@ class BCGGANTrainer:
         output[:, ~covered] = corrupted[:, ~covered]
         return output
 
-    def clean_recording(self, corrupted: np.ndarray, fs: float, window_s: float = 1.0, stride_s: float = 1.0, batch_size: int = 32) -> np.ndarray:
+    def clean_recording(self, corrupted: np.ndarray, fs: float, window_s: float = 5.0, stride_s: float = 5.0, batch_size: int = 32) -> np.ndarray:
         """Clean a recording, applying a one-channel checkpoint independently per channel."""
         corrupted = np.asarray(corrupted)
         if corrupted.ndim != 2:

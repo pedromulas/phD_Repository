@@ -21,8 +21,8 @@ def apply_checkpoint(
     checkpoint: Path,
     corrupted_set: Path,
     output: Path,
-    window_s: float = 1.0,
-    stride_s: float = 1.0,
+    window_s: float = 5.0,
+    stride_s: float = 5.0,
     batch_size: int = 32,
 ) -> dict[str, object]:
     """Load only contaminated EEG, clean it, and save a portable NumPy result."""
@@ -52,8 +52,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--corrupted-set", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--window-seconds", type=float, default=1.0)
-    parser.add_argument("--stride-seconds", type=float, default=1.0)
+    parser.add_argument("--window-seconds", type=float, default=5.0, help="Must match the 5-second windows used during training.")
+    parser.add_argument("--stride-seconds", type=float, default=5.0, help="Use 5 seconds to concatenate non-overlapping model outputs.")
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
     result = apply_checkpoint(args.checkpoint, args.corrupted_set, args.output, args.window_seconds, args.stride_seconds, args.batch_size)
