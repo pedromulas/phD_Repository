@@ -639,6 +639,92 @@ def run_iva_ga_pipeline(
     return result
 
 
+def run_blockwise_iva_ga_pipeline(
+    signal: ArrayLike,
+    TR: float,
+    fs: float,
+    epochs_per_block: int = 40,
+    overlap_epochs: int = 4,
+    offset: int = 0,
+    periodic_frequency_hz: float = 14.0,
+    iva_g_max_iter: int = 100,
+    iva_l_max_iter: int = 200,
+    whiten: bool = True,
+    verbose: bool = False,
+    random_state: int | None = 0,
+) -> dict[str, Any]:
+    """Remove GA with IVA in overlapping blocks of complete TR epochs.
+
+    The direct IVA formulation treats each TR epoch as a source. Processing a
+    long recording in blocks therefore bounds the cubic source-dimension cost.
+    Cleaned overlap epochs are averaged before being restored continuously.
+    """
+    if epochs_per_block < 2:
+        raise ValueError("epochs_per_block must be at least two.")
+    if not 0 <= overlap_epochs < epochs_per_block - 1:
+        raise ValueError("overlap_epochs must be non-negative and smaller than epochs_per_block - 1.")
+    signal_2d, was_1d = _as_2d(signal)
+    t_samples = tr_to_samples(TR, fs)
+    epochs = segment_signal(signal_2d, T_samples=t_samples, offset=offset)
+    n_epochs = epochs.shape[1]
+    if n_epochs <= epochs_per_block:
+        result = run_iva_ga_pipeline(
+            signal_2d, TR, fs, offset, periodic_frequency_hz, iva_g_max_iter,
+            iva_l_max_iter, whiten, verbose, random_state,
+        )
+        result["blockwise"] = False
+        return result
+
+    step = epochs_per_block - overlap_epochs
+    accumulated = np.zeros_like(epochs)
+    counts = np.zeros(n_epochs, dtype=np.int32)
+    block_details: list[dict[str, Any]] = []
+    for block_index, start in enumerate(range(0, n_epochs, step)):
+        stop = min(start + epochs_per_block, n_epochs)
+        if stop - start < 2:
+            break
+        block_epochs = epochs[:, start:stop]
+        X = epochs_to_iva_datasets(block_epochs)
+        iva_result = run_iva_gl(
+            X, iva_g_max_iter=iva_g_max_iter, iva_l_max_iter=iva_l_max_iter,
+            whiten=whiten, verbose=verbose,
+            random_state=None if random_state is None else random_state + block_index,
+        )
+        component = identify_ga_component(
+            raw_epochs=block_epochs, Y=iva_result["Y"], sigma_scv=iva_result["sigma_l"],
+            fs=fs, periodic_frequency_hz=periodic_frequency_hz,
+        )
+        reconstruction = reconstruct_without_component(
+            X=X, Y=iva_result["Y"], A=iva_result["A_l"], excluded_component=component["ga_component"],
+        )
+        cleaned_epochs = iva_datasets_to_epochs(reconstruction["X_clean"])
+        accumulated[:, start:stop] += cleaned_epochs
+        counts[start:stop] += 1
+        block_details.append({
+            "start_epoch": start, "stop_epoch": stop, "ga_component": int(component["ga_component"]),
+        })
+        if stop == n_epochs:
+            break
+
+    combined_epochs = accumulated / np.maximum(counts[np.newaxis, :, np.newaxis], 1)
+    cleaned = signal_2d.copy()
+    usable = combined_epochs.shape[1] * combined_epochs.shape[2]
+    cleaned[:, offset : offset + usable] = combined_epochs.reshape(signal_2d.shape[0], usable)
+    return {
+        "cleaned_signal": cleaned[0] if was_1d else cleaned,
+        "T_samples": t_samples,
+        "offset": offset,
+        "TR": float(TR),
+        "fs": float(fs),
+        "library_used": "independent_vector_analysis",
+        "blockwise": True,
+        "epochs_per_block": epochs_per_block,
+        "overlap_epochs": overlap_epochs,
+        "n_epochs": n_epochs,
+        "blocks": block_details,
+    }
+
+
 def apply_iva_ga_to_raw(
     raw: mne.io.BaseRaw,
     TR: float,
@@ -651,6 +737,8 @@ def apply_iva_ga_to_raw(
     whiten: bool = True,
     verbose: bool = False,
     random_state: int | None = 0,
+    epochs_per_block: int | None = None,
+    overlap_epochs: int = 0,
 ) -> tuple[mne.io.RawArray, dict[str, Any]]:
     """Apply IVA-GA to an MNE Raw and return a cleaned RawArray."""
     raw_in = raw.copy().load_data()
@@ -666,18 +754,16 @@ def apply_iva_ga_to_raw(
 
     data = raw_proc.get_data()
     fs = float(raw_proc.info["sfreq"])
-    result = run_iva_ga_pipeline(
-        signal=data,
-        TR=TR,
-        fs=fs,
-        offset=offset,
-        periodic_frequency_hz=periodic_frequency_hz,
-        iva_g_max_iter=iva_g_max_iter,
-        iva_l_max_iter=iva_l_max_iter,
-        whiten=whiten,
-        verbose=verbose,
-        random_state=random_state,
-    )
+    pipeline = run_iva_ga_pipeline if epochs_per_block is None else run_blockwise_iva_ga_pipeline
+    kwargs: dict[str, Any] = {
+        "signal": data, "TR": TR, "fs": fs, "offset": offset,
+        "periodic_frequency_hz": periodic_frequency_hz, "iva_g_max_iter": iva_g_max_iter,
+        "iva_l_max_iter": iva_l_max_iter, "whiten": whiten, "verbose": verbose,
+        "random_state": random_state,
+    }
+    if epochs_per_block is not None:
+        kwargs.update({"epochs_per_block": epochs_per_block, "overlap_epochs": overlap_epochs})
+    result = pipeline(**kwargs)
 
     raw_clean_full = raw_in.copy()
     pick_indices = [raw_in.ch_names.index(ch_name) for ch_name in picks]

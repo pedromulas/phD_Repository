@@ -10,8 +10,10 @@ import numpy as np
 
 try:  # Supports both ``python -m functions...`` and direct script execution.
     from functions.bcggan import BCGGANTrainer
+    from functions.preprocessing_window import crop_mne_raw
 except ModuleNotFoundError:  # pragma: no cover - direct execution convenience
     from bcggan import BCGGANTrainer
+    from preprocessing_window import crop_mne_raw
 
 
 _AUXILIARY_TOKENS = ("ECG", "EKG", "VREF", "TRIG", "STI", "MISC", "RESP", "EOG", "EMG", "AUX")
@@ -24,9 +26,12 @@ def apply_checkpoint(
     window_s: float = 5.0,
     stride_s: float = 5.0,
     batch_size: int = 32,
+    crop_start_seconds: float | None = None,
+    crop_duration_seconds: float | None = None,
 ) -> dict[str, object]:
     """Load only contaminated EEG, clean it, and save a portable NumPy result."""
     raw = mne.io.read_raw_eeglab(corrupted_set, preload=True, verbose="ERROR")
+    raw, crop_info = crop_mne_raw(raw, crop_start_seconds, crop_duration_seconds)
     corrupted = raw.get_data()
     trainer = BCGGANTrainer.load_checkpoint(checkpoint)
     if trainer.config.channels == 1:
@@ -41,6 +46,8 @@ def apply_checkpoint(
         "corrupted_signal": corrupted,
         "fs": float(raw.info["sfreq"]),
         "channel_names": np.asarray(raw.ch_names),
+        "crop_start_sec": float(crop_info["start_sec"]),
+        "crop_stop_sec": float(crop_info["stop_sec"]),
     }
     np.savez_compressed(output, **result)
     # TODO: add test-set quality metrics once the project selects their definitions.
@@ -55,8 +62,14 @@ def main() -> None:
     parser.add_argument("--window-seconds", type=float, default=5.0, help="Must match the 5-second windows used during training.")
     parser.add_argument("--stride-seconds", type=float, default=5.0, help="Use 5 seconds to concatenate non-overlapping model outputs.")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--crop-start-seconds", type=float)
+    parser.add_argument("--crop-duration-seconds", type=float)
     args = parser.parse_args()
-    result = apply_checkpoint(args.checkpoint, args.corrupted_set, args.output, args.window_seconds, args.stride_seconds, args.batch_size)
+    result = apply_checkpoint(
+        args.checkpoint, args.corrupted_set, args.output,
+        args.window_seconds, args.stride_seconds, args.batch_size,
+        args.crop_start_seconds, args.crop_duration_seconds,
+    )
     print(f"Saved cleaned EEG to {args.output} ({result['cleaned_signal'].shape}).")
 
 

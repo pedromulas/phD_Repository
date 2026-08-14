@@ -74,4 +74,8 @@ def apply_pca_artifact_rejection(
         "frontal_ratio": frontal_ratio,
         "low_frequency_power": delta_theta,
         "gamma_power": gamma,
+        # Keep the decomposition compact but available to callers that need to
+        # save it for later visual inspection (channels x components).
+        "spatial_components": spatial,
+        "component_scores": scores,
     }

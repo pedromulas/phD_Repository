@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from fractions import Fraction
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
-from scipy.signal import welch
+from scipy.signal import resample_poly, welch
 
 
 _AUXILIARY_TOKENS = ("ECG", "EKG", "VREF", "TRIG", "STI", "MISC", "RESP", "EOG", "EMG", "AUX")
@@ -173,13 +174,39 @@ def main() -> None:
     parser.add_argument("--signal-key", default="cleaned_signal", help="Array key used only for .npz processed files.")
     parser.add_argument("--reference-signal-key", default="cleaned_signal", help="Array key used only for .npz reference files.")
     parser.add_argument("--include-auxiliary", action="store_true", help="Also evaluate ECG and auxiliary channels.")
+    parser.add_argument("--resample-reference", action="store_true", help="Resample the reference to the processed sampling rate when they differ.")
+    parser.add_argument("--reference-start-seconds", type=float, default=0.0, help="Crop the reference from this original-recording time before evaluation.")
+    parser.add_argument("--max-duration-seconds", type=float, help="Evaluate at most this duration from the processed and cropped-reference signals.")
     parser.add_argument("--psd-channel", help="Channel for the PSD comparison figure; defaults to the first evaluated channel.")
     args = parser.parse_args()
 
     processed, processed_fs, processed_names = _load_signal(args.processed, args.signal_key)
     reference, reference_fs, reference_names = _load_signal(args.reference, args.reference_signal_key)
+    reference_resampled = False
     if not np.isclose(processed_fs, reference_fs):
-        raise ValueError(f"Sampling rates differ ({processed_fs} vs {reference_fs} Hz); resample explicitly before evaluation.")
+        if not args.resample_reference:
+            raise ValueError(f"Sampling rates differ ({processed_fs} vs {reference_fs} Hz); use --resample-reference or resample explicitly.")
+        ratio = Fraction(processed_fs / reference_fs).limit_denominator(10_000)
+        reference = resample_poly(reference, ratio.numerator, ratio.denominator, axis=-1)
+        reference_fs = processed_fs
+        reference_resampled = True
+    if args.reference_start_seconds < 0:
+        raise ValueError("--reference-start-seconds must be non-negative.")
+    reference_start = int(round(args.reference_start_seconds * reference_fs))
+    if reference_start >= reference.shape[1]:
+        raise ValueError("The requested reference start lies outside the reference recording.")
+    reference = reference[:, reference_start:]
+    if args.max_duration_seconds is not None:
+        if args.max_duration_seconds <= 0:
+            raise ValueError("--max-duration-seconds must be strictly positive.")
+        processed_limit = int(round(args.max_duration_seconds * processed_fs))
+        reference_limit = int(round(args.max_duration_seconds * reference_fs))
+        if processed.shape[1] < processed_limit:
+            raise ValueError("The processed signal is shorter than --max-duration-seconds.")
+        if reference.shape[1] < reference_limit:
+            raise ValueError("The cropped reference is shorter than --max-duration-seconds.")
+        processed = processed[:, :processed_limit]
+        reference = reference[:, :reference_limit]
     common = _select_common_eeg_channels(processed_names, reference_names, args.include_auxiliary)
     n_samples = min(processed.shape[1], reference.shape[1])
     candidate = np.vstack([processed[processed_index, :n_samples] for _, processed_index, _ in common])
@@ -194,7 +221,14 @@ def main() -> None:
     json_path = prefix.with_name(f"{prefix.name}_summary_metrics.json")
     summary_plot = prefix.with_name(f"{prefix.name}_summary.png")
     _write_csv(rows, csv_path)
-    summary = _summary(rows) | {"method": method_name, "sampling_frequency_hz": processed_fs, "samples_evaluated": n_samples, "seconds_evaluated": n_samples / processed_fs}
+    summary = _summary(rows) | {
+        "method": method_name,
+        "sampling_frequency_hz": processed_fs,
+        "reference_resampled": reference_resampled,
+        "reference_start_seconds": args.reference_start_seconds,
+        "samples_evaluated": n_samples,
+        "seconds_evaluated": n_samples / processed_fs,
+    }
     json_path.write_text(json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8")
     _plot_summary(rows, summary_plot, method_name)
     psd_channel = args.psd_channel or channel_names[0]

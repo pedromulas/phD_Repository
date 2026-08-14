@@ -25,12 +25,17 @@ def main() -> None:
     parser.add_argument("--dataset-name", default="Dataset1")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--crop-start-seconds", type=float)
+    parser.add_argument("--crop-duration-seconds", type=float)
     args = parser.parse_args()
     eeg_path = args.eeg_root / args.subject / "eeg" / f"{args.subject}_task-{args.task}_eeg.set"
     if not eeg_path.is_file(): raise FileNotFoundError(f"EEGLAB header not found: {eeg_path}")
     if not args.checkpoint.is_file(): raise FileNotFoundError(f"DAR checkpoint not found: {args.checkpoint}")
     output = args.output or preprocessing_output_path(args.preprocessing_root, args.dataset_name, "DAR", args.subject, args.task)
-    result = apply_dar_checkpoint(args.checkpoint, eeg_path, output, args.batch_size)
+    result = apply_dar_checkpoint(
+        args.checkpoint, eeg_path, output, args.batch_size,
+        args.crop_start_seconds, args.crop_duration_seconds,
+    )
     print(f"Saved DAR-cleaned EEG to {output} ({result['cleaned_signal'].shape}).")
 
 

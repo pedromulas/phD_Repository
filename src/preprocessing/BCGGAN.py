@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct execution convenience
 
 
 DEFAULT_EEG_ROOT = Path("data/raw/Dataset1/Simultaneous_EEG_fMRI/BIDS_dataset_EEG")
-DEFAULT_CHECKPOINT = Path("data/models/training1/best.pt")
+DEFAULT_CHECKPOINT = Path("data/models/BCGGAN/training1/best.pt")
 
 
 def main() -> None:
@@ -30,6 +30,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Optional explicit output path; otherwise the standard BCGGAN path is used.")
     parser.add_argument("--window-seconds", type=float, default=5.0, help="Must match the 5-second training windows.")
     parser.add_argument("--batch-size", type=int, default=4, help="Reduce if CUDA runs out of memory.")
+    parser.add_argument("--crop-start-seconds", type=float)
+    parser.add_argument("--crop-duration-seconds", type=float)
     args = parser.parse_args()
 
     eeg_path = args.eeg_root / args.subject / "eeg" / f"{args.subject}_task-{args.task}_eeg.set"
@@ -47,6 +49,8 @@ def main() -> None:
         window_s=args.window_seconds,
         stride_s=args.window_seconds,
         batch_size=args.batch_size,
+        crop_start_seconds=args.crop_start_seconds,
+        crop_duration_seconds=args.crop_duration_seconds,
     )
     print(f"Saved BCGGAN-cleaned EEG to {output_path} ({result['cleaned_signal'].shape}).")
 

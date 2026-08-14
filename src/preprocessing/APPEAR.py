@@ -27,12 +27,14 @@ try:  # Supports both ``python -m`` and direct script execution.
     from functions.fastr_ga import FASTRConfig, fastr_remove_gradient_artifact
     from functions.ica_conventional import apply_conventional_ica
     from functions.preprocessing_paths import preprocessing_output_path
+    from functions.preprocessing_window import crop_mne_raw
 except ModuleNotFoundError:  # pragma: no cover - direct execution convenience
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from functions.appear_utils import add_bad_interval_annotations, apply_event_locked_aas, detect_bad_intervals_for_ica, load_subject_fmri_acquisition
     from functions.fastr_ga import FASTRConfig, fastr_remove_gradient_artifact
     from functions.ica_conventional import apply_conventional_ica
     from functions.preprocessing_paths import preprocessing_output_path
+    from functions.preprocessing_window import crop_mne_raw
 
 
 DEFAULT_EEG_ROOT = Path("data/raw/Dataset1/Simultaneous_EEG_fMRI/BIDS_dataset_EEG")
@@ -83,9 +85,14 @@ def run_appear(
     ecg_channel: str | None = None,
     skip_bcg: bool = False,
     ica_exclude: tuple[int, ...] = (),
+    auto_ocular_ica: bool = True,
+    auto_muscle_ica: bool = True,
+    crop_start_seconds: float | None = None,
+    crop_duration_seconds: float | None = None,
 ) -> tuple[mne.io.BaseRaw, dict[str, object]]:
     """Run the core APPEAR stages and return a cleaned MNE recording."""
     raw = mne.io.read_raw_eeglab(eeg_path, preload=True, verbose="ERROR")
+    raw, crop_info = crop_mne_raw(raw, crop_start_seconds, crop_duration_seconds)
     acquisition = load_subject_fmri_acquisition(fmri_root, subject)
     tr_sec, n_slices = float(acquisition["tr_sec"]), int(acquisition["n_slices"])
     slice_period, slice_frequency = tr_sec / n_slices, n_slices / tr_sec
@@ -142,6 +149,8 @@ def run_appear(
         manual_exclude=ica_exclude,
         method="infomax",
         fit_l_freq=1.0,
+        auto_ocular=auto_ocular_ica,
+        auto_muscle=auto_muscle_ica,
         random_state=97,
     )
     ga_summary = {
@@ -158,6 +167,7 @@ def run_appear(
         "slice_period_sec": slice_period,
         "slice_frequency_hz": slice_frequency,
         "fmri_metadata": acquisition,
+        "input_crop": crop_info,
         "use_fmri_checkpoint": use_fmri_checkpoint,
         "ga": ga_summary,
         "notch_frequencies_hz": notches,
@@ -166,7 +176,16 @@ def run_appear(
         "bad_intervals_sec": bad_intervals,
         "ica_method": ica_result["method"],
         "ica_excluded_components": ica_result["excluded_components"],
+        "ica_ocular_candidates": ica_result["ocular_candidates"],
+        "ica_muscle_candidates": ica_result["muscle_candidates"],
         "ica_components": int(ica_result["ica"].n_components_),
+        # Kept out of the JSON metadata; the CLI stores it as a standard FIF
+        # ICA file for MNE visualisation.
+        "_ica_object": ica_result["ica"],
+        "_ica_picks": ica_result["picks"],
+        "_ica_topographies": ica_result["ica"].get_components(),
+        "_ica_ocular_candidates": ica_result["ocular_candidates"],
+        "_ica_muscle_candidates": ica_result["muscle_candidates"],
     }
     return raw_clean, details
 
@@ -182,12 +201,16 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Optional explicit output path; otherwise the standard APPEAR path is used.")
     parser.add_argument("--use-fmri-checkpoint", action="store_true", help="Detect T0/Tf from GA morphology before FASTR; disabled by default.")
     parser.add_argument("--calibration-seconds", type=float, default=5.0)
+    parser.add_argument("--crop-start-seconds", type=float)
+    parser.add_argument("--crop-duration-seconds", type=float)
     parser.add_argument("--low-hz", type=float, default=1.0, help="Use 0.1 Hz for task/ERP data, as in APPEAR.")
     parser.add_argument("--high-hz", type=float, default=70.0)
     parser.add_argument("--downsample-hz", type=float, default=250.0)
     parser.add_argument("--ecg-channel", help="ECG channel used for cardiac-event BCG AAS; autodetected by default.")
     parser.add_argument("--skip-bcg", action="store_true")
     parser.add_argument("--ica-exclude", type=int, nargs="*", default=(), help="Infomax component indices to exclude after inspection.")
+    parser.add_argument("--no-auto-ocular-ica", action="store_false", dest="auto_ocular_ica", default=True)
+    parser.add_argument("--no-auto-muscle-ica", action="store_false", dest="auto_muscle_ica", default=True)
     args = parser.parse_args()
     eeg_path = args.eeg_root / args.subject / "eeg" / f"{args.subject}_task-{args.task}_eeg.set"
     if not eeg_path.is_file():
@@ -195,17 +218,32 @@ def main() -> None:
     clean, details = run_appear(
         eeg_path, args.fmri_root, args.subject, args.use_fmri_checkpoint,
         args.calibration_seconds, args.low_hz, args.high_hz, args.downsample_hz,
-        args.ecg_channel, args.skip_bcg, tuple(args.ica_exclude),
+        args.ecg_channel, args.skip_bcg, tuple(args.ica_exclude), args.auto_ocular_ica, args.auto_muscle_ica,
+        args.crop_start_seconds, args.crop_duration_seconds,
     )
     output_path = args.output or preprocessing_output_path(
         args.preprocessing_root, args.dataset_name, "APPEAR", args.subject, args.task,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_path, cleaned_signal=clean.get_data(), fs=float(clean.info["sfreq"]), channel_names=np.asarray(clean.ch_names))
+    ica = details.pop("_ica_object")
+    ica_picks = details.pop("_ica_picks")
+    ica_topographies = details.pop("_ica_topographies")
+    ica_ocular = details.pop("_ica_ocular_candidates")
+    ica_muscle = details.pop("_ica_muscle_candidates")
+    ica_path = output_path.with_name(f"{output_path.stem}_ica.fif")
+    ica.save(ica_path, overwrite=True)
+    np.savez_compressed(
+        output_path.with_name(f"{output_path.stem}_ica_analysis.npz"),
+        channel_names=np.asarray(ica_picks), topographies=np.asarray(ica_topographies),
+        excluded_components=np.asarray(details["ica_excluded_components"], dtype=int),
+        ocular_candidates=np.asarray(ica_ocular, dtype=int), muscle_candidates=np.asarray(ica_muscle, dtype=int),
+    )
     metadata_path = output_path.with_suffix(".json")
     # Large intermediate NumPy arrays from FASTR and ICA are intentionally omitted.
     metadata_path.write_text(json.dumps(details, indent=2, default=lambda value: value.tolist() if isinstance(value, np.ndarray) else str(value)), encoding="utf-8")
     print(f"Saved APPEAR-cleaned EEG to {output_path} ({clean.get_data().shape}).")
+    print(f"Saved ICA decomposition to {ica_path}.")
     print(f"TR={details['tr_sec']} s | slices={details['n_slices']} | ICA components removed={details['ica_excluded_components']}")
 
 
